@@ -29,7 +29,7 @@ class TypeTranslator(
     private val symbolTable: ReferenceSymbolTable,
     val languageVersionSettings: LanguageVersionSettings,
     builtIns: KotlinBuiltIns,
-    private val typeParametersResolver: TypeParametersResolver = ScopedTypeParametersResolver(),
+    val typeParametersResolver: MutableTypeParametersResolver = ScopedTypeParametersResolver(),
     private val enterTableScope: Boolean = false
 ) {
 
@@ -68,16 +68,19 @@ class TypeTranslator(
         return result
     }
 
-    private fun resolveTypeParameter(typeParameterDescriptor: TypeParameterDescriptor): IrTypeParameterSymbol {
+    private fun resolveTypeParameter(
+        typeParameterDescriptor: TypeParameterDescriptor,
+        typeParametersResolver: TypeParametersResolver
+    ): IrTypeParameterSymbol {
         val originalTypeParameter = typeParameterDescriptor.originalTypeParameter
         return typeParametersResolver.resolveScopedTypeParameter(originalTypeParameter)
             ?: symbolTable.referenceTypeParameter(originalTypeParameter)
     }
 
-    fun translateType(kotlinType: KotlinType): IrType =
-        translateType(kotlinType, Variance.INVARIANT).type
+    fun translateType(kotlinType: KotlinType, typeParametersResolver: TypeParametersResolver = this.typeParametersResolver): IrType =
+        translateType(kotlinType, Variance.INVARIANT, typeParametersResolver).type
 
-    private fun translateType(kotlinType: KotlinType, variance: Variance): IrTypeProjection {
+    private fun translateType(kotlinType: KotlinType, variance: Variance, typeParametersResolver: TypeParametersResolver): IrTypeProjection {
         val flexibleApproximatedType = approximate(kotlinType)
 
         when {
@@ -99,7 +102,7 @@ class TypeTranslator(
                     // This hack is about type parameter leak in case of generic delegated property
                     // Such code has to be prohibited since LV 1.5
                     // For more details see commit message or KT-24643
-                    return approximateUpperBounds(ktTypeDescriptor.upperBounds, variance)
+                    return approximateUpperBounds(ktTypeDescriptor.upperBounds, variance, typeParametersResolver)
                 }
             }
         }
@@ -108,16 +111,16 @@ class TypeTranslator(
             this.kotlinType = flexibleApproximatedType
             this.hasQuestionMark = approximatedType.isMarkedNullable
             this.variance = variance
-            this.abbreviation = approximatedType.getAbbreviation()?.toIrTypeAbbreviation()
+            this.abbreviation = approximatedType.getAbbreviation()?.toIrTypeAbbreviation(typeParametersResolver)
             when (ktTypeDescriptor) {
                 is TypeParameterDescriptor -> {
-                    classifier = resolveTypeParameter(ktTypeDescriptor)
+                    classifier = resolveTypeParameter(ktTypeDescriptor, typeParametersResolver)
                     annotations = translateTypeAnnotations(approximatedType.annotations)
                 }
 
                 is ClassDescriptor -> {
                     classifier = symbolTable.referenceClass(ktTypeDescriptor)
-                    arguments = translateTypeArguments(approximatedType.arguments)
+                    arguments = translateTypeArguments(approximatedType.arguments, typeParametersResolver)
                     annotations = translateTypeAnnotations(approximatedType.annotations)
                 }
 
@@ -127,12 +130,16 @@ class TypeTranslator(
         }.buildTypeProjection()
     }
 
-    private fun approximateUpperBounds(upperBounds: Collection<KotlinType>, variance: Variance): IrTypeProjection {
+    private fun approximateUpperBounds(
+        upperBounds: Collection<KotlinType>,
+        variance: Variance,
+        typeParametersResolver: TypeParametersResolver
+    ): IrTypeProjection {
         val commonSupertype = CommonSupertypes.commonSupertype(upperBounds)
-        return translateType(approximate(commonSupertype.replaceArgumentsWithStarProjections()), variance)
+        return translateType(approximate(commonSupertype.replaceArgumentsWithStarProjections()), variance, typeParametersResolver)
     }
 
-    private fun SimpleType.toIrTypeAbbreviation(): IrTypeAbbreviation {
+    private fun SimpleType.toIrTypeAbbreviation(typeParametersResolver: TypeParametersResolver): IrTypeAbbreviation {
         val typeAliasDescriptor = constructor.declarationDescriptor.let {
             it as? TypeAliasDescriptor
                 ?: throw AssertionError("TypeAliasDescriptor expected: $it")
@@ -140,7 +147,7 @@ class TypeTranslator(
         return IrTypeAbbreviationImpl(
             symbolTable.referenceTypeAlias(typeAliasDescriptor),
             isMarkedNullable,
-            translateTypeArguments(this.arguments),
+            translateTypeArguments(this.arguments, typeParametersResolver),
             translateTypeAnnotations(this.annotations)
         )
     }
@@ -184,11 +191,11 @@ class TypeTranslator(
     private fun translateTypeAnnotations(annotations: Annotations): List<IrConstructorCall> =
         annotations.mapNotNull(constantValueGenerator::generateAnnotationConstructorCall)
 
-    private fun translateTypeArguments(arguments: List<TypeProjection>) =
+    private fun translateTypeArguments(arguments: List<TypeProjection>, typeParametersResolver: TypeParametersResolver) =
         arguments.map {
             if (it.isStarProjection)
                 IrStarProjectionImpl
             else
-                translateType(it.type, it.projectionKind)
+                translateType(it.type, it.projectionKind, typeParametersResolver)
         }
 }

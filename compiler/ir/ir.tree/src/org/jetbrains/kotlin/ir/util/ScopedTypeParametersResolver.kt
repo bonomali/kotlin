@@ -11,13 +11,16 @@ import org.jetbrains.kotlin.ir.symbols.IrTypeParameterSymbol
 import java.util.*
 
 interface TypeParametersResolver {
-    fun enterTypeParameterScope(typeParametersContainer: IrTypeParametersContainer)
-    fun leaveTypeParameterScope()
-
     fun resolveScopedTypeParameter(typeParameterDescriptor: TypeParameterDescriptor): IrTypeParameterSymbol?
 }
 
-class ScopedTypeParametersResolver : TypeParametersResolver {
+interface MutableTypeParametersResolver : TypeParametersResolver {
+    fun enterTypeParameterScope(typeParametersContainer: IrTypeParametersContainer)
+    fun leaveTypeParameterScope()
+    fun snapshot(): TypeParametersResolver
+}
+
+class ScopedTypeParametersResolver : MutableTypeParametersResolver {
 
     private val typeParameterScopes = ArrayDeque<Map<TypeParameterDescriptor, IrTypeParameterSymbol>>()
 
@@ -33,6 +36,20 @@ class ScopedTypeParametersResolver : TypeParametersResolver {
         typeParameterScopes.removeFirst()
     }
 
+    override fun resolveScopedTypeParameter(typeParameterDescriptor: TypeParameterDescriptor): IrTypeParameterSymbol? {
+        for (scope in typeParameterScopes) {
+            val local = scope[typeParameterDescriptor]
+            if (local != null) return local
+        }
+        return null
+    }
+
+    override fun snapshot(): TypeParametersResolver = TypeParametersResolverSnapshot(typeParameterScopes.toList())
+}
+
+class TypeParametersResolverSnapshot(
+    private val typeParameterScopes: List<Map<TypeParameterDescriptor, IrTypeParameterSymbol>>
+) : TypeParametersResolver {
     override fun resolveScopedTypeParameter(typeParameterDescriptor: TypeParameterDescriptor): IrTypeParameterSymbol? {
         for (scope in typeParameterScopes) {
             val local = scope[typeParameterDescriptor]

@@ -33,6 +33,7 @@ import org.jetbrains.kotlin.ir.expressions.impl.IrTypeOperatorCallImpl
 import org.jetbrains.kotlin.ir.symbols.IrConstructorSymbol
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.impl.originalKotlinType
+import org.jetbrains.kotlin.ir.util.TypeParametersResolver
 import org.jetbrains.kotlin.ir.util.TypeTranslator
 import org.jetbrains.kotlin.ir.util.coerceToUnit
 import org.jetbrains.kotlin.ir.visitors.IrElementTransformerVoid
@@ -64,22 +65,24 @@ internal class InsertImplicitCasts(
 ) : IrElementTransformerVoid() {
 
     private val expectedFunctionExpressionReturnType = hashMapOf<FunctionDescriptor, IrType>()
-    private val returnExpressionsToBePostprocessed = arrayListOf<IrReturn>()
+    private val returnExpressionsToBePostprocessed = arrayListOf<ReturnExpressionToPostprocess>()
 
     fun run(element: IrElement) {
         element.transformChildrenVoid(this)
-        for (irReturn in returnExpressionsToBePostprocessed) {
-            postprocessReturnExpression(irReturn)
+        for (expressionToPostprocess in returnExpressionsToBePostprocessed) {
+            postprocessReturnExpression(expressionToPostprocess)
         }
     }
 
-    private fun postprocessReturnExpression(irReturn: IrReturn) {
+    private fun postprocessReturnExpression(expressionToPostprocess: ReturnExpressionToPostprocess) {
+        val (irReturn, typeParametersResolver) = expressionToPostprocess
         val returnTarget = irReturn.returnTarget
         val expectedReturnType = expectedFunctionExpressionReturnType[returnTarget] ?: return
-        irReturn.value = irReturn.value.cast(expectedReturnType)
+        irReturn.value = irReturn.value.cast(expectedReturnType, typeParametersResolver)
     }
 
-    private fun KotlinType.toIrType() = typeTranslator.translateType(this)
+    private fun KotlinType.toIrType(typeParametersResolver: TypeParametersResolver = typeTranslator.typeParametersResolver)
+            = typeTranslator.translateType(this, typeParametersResolver)
 
     private val IrDeclarationReference.substitutedDescriptor
         get() = callToSubstitutedDescriptorMap[this] ?: symbol.descriptor as CallableDescriptor
@@ -173,7 +176,9 @@ internal class InsertImplicitCasts(
                 val returnTargetDescriptor = expression.returnTarget
                 val isLambdaReturnValue = returnTargetDescriptor is AnonymousFunctionDescriptor
                 if (isLambdaReturnValue) {
-                    returnExpressionsToBePostprocessed.add(expression)
+                    returnExpressionsToBePostprocessed.add(
+                        ReturnExpressionToPostprocess(expression, typeTranslator.typeParametersResolver.snapshot())
+                    )
                 }
                 value.cast(returnTargetDescriptor.returnType, isLambdaReturnValue = isLambdaReturnValue)
             }
@@ -286,12 +291,18 @@ internal class InsertImplicitCasts(
             }
         }
 
-    private fun IrExpressionBody.coerceInnerExpression(expectedType: KotlinType) {
-        expression = expression.cast(expectedType)
+    private fun IrExpressionBody.coerceInnerExpression(
+        expectedType: KotlinType,
+        typeParametersResolver: TypeParametersResolver = typeTranslator.typeParametersResolver
+    ) {
+        expression = expression.cast(expectedType, typeParametersResolver = typeParametersResolver)
     }
 
-    private fun IrExpression.cast(irType: IrType): IrExpression =
-        cast(irType.originalKotlinType)
+    private fun IrExpression.cast(
+        irType: IrType,
+        typeParametersResolver: TypeParametersResolver = typeTranslator.typeParametersResolver
+    ): IrExpression =
+        cast(irType.originalKotlinType, typeParametersResolver = typeParametersResolver)
 
     private fun KotlinType.getFunctionReturnTypeOrNull(): KotlinType? =
         if (isFunctionType || isSuspendFunctionType)
@@ -302,7 +313,8 @@ internal class InsertImplicitCasts(
     private fun IrExpression.cast(
         possiblyNonDenotableExpectedType: KotlinType?,
         originalExpectedType: KotlinType? = possiblyNonDenotableExpectedType,
-        isLambdaReturnValue: Boolean = false
+        isLambdaReturnValue: Boolean = false,
+        typeParametersResolver: TypeParametersResolver = typeTranslator.typeParametersResolver
     ): IrExpression {
         if (possiblyNonDenotableExpectedType == null) return this
         if (possiblyNonDenotableExpectedType.isError) return this
@@ -325,23 +337,23 @@ internal class InsertImplicitCasts(
                 if (expectedType.isNullableAny())
                     this
                 else
-                    implicitCast(expectedType, IrTypeOperator.IMPLICIT_DYNAMIC_CAST)
+                    implicitCast(expectedType, IrTypeOperator.IMPLICIT_DYNAMIC_CAST, typeParametersResolver)
 
             valueType.isNullabilityFlexible() && valueType.containsNull() && !expectedType.acceptsNullValues() ->
-                implicitNonNull(valueType, expectedType)
+                implicitNonNull(valueType, expectedType, typeParametersResolver)
 
             (valueType.hasEnhancedNullability() && !isLambdaReturnValue) && !expectedType.acceptsNullValues() ->
-                implicitNonNull(valueType, expectedType)
+                implicitNonNull(valueType, expectedType, typeParametersResolver)
 
             KotlinTypeChecker.DEFAULT.isSubtypeOf(valueType, expectedType.makeNullable()) ->
                 this
 
             KotlinBuiltIns.isInt(valueType) && notNullableExpectedType.isBuiltInIntegerType() ->
-                implicitCast(notNullableExpectedType, IrTypeOperator.IMPLICIT_INTEGER_COERCION)
+                implicitCast(notNullableExpectedType, IrTypeOperator.IMPLICIT_INTEGER_COERCION, typeParametersResolver)
 
             else -> {
                 val targetType = if (!valueType.containsNull()) notNullableExpectedType else expectedType
-                implicitCast(targetType, IrTypeOperator.IMPLICIT_CAST)
+                implicitCast(targetType, IrTypeOperator.IMPLICIT_CAST, typeParametersResolver)
             }
         }
     }
@@ -366,17 +378,21 @@ internal class InsertImplicitCasts(
     private fun KotlinType.hasEnhancedNullability() =
         generatorExtensions.enhancedNullability.hasEnhancedNullability(this)
 
-    private fun IrExpression.implicitNonNull(valueType: KotlinType, expectedType: KotlinType): IrExpression {
+    private fun IrExpression.implicitNonNull(
+        valueType: KotlinType, expectedType: KotlinType, typeParametersResolver: TypeParametersResolver
+    ): IrExpression {
         val nonNullFlexibleType = valueType.upperIfFlexible().makeNotNullable()
         val nonNullValueType = generatorExtensions.enhancedNullability.stripEnhancedNullability(nonNullFlexibleType)
-        return implicitCast(nonNullValueType, IrTypeOperator.IMPLICIT_NOTNULL).cast(expectedType)
+        return implicitCast(nonNullValueType, IrTypeOperator.IMPLICIT_NOTNULL, typeParametersResolver)
+            .cast(expectedType, typeParametersResolver = typeParametersResolver)
     }
 
     private fun IrExpression.implicitCast(
         targetType: KotlinType,
-        typeOperator: IrTypeOperator
+        typeOperator: IrTypeOperator,
+        typeParametersResolver: TypeParametersResolver
     ): IrExpression {
-        val irType = targetType.toIrType()
+        val irType = targetType.toIrType(typeParametersResolver)
         return IrTypeOperatorCallImpl(
             startOffset,
             endOffset,
@@ -396,4 +412,6 @@ internal class InsertImplicitCasts(
                 KotlinBuiltIns.isUShort(this) ||
                 KotlinBuiltIns.isUInt(this) ||
                 KotlinBuiltIns.isULong(this)
+
+    private data class ReturnExpressionToPostprocess(val irReturn: IrReturn, val typeParametersResolver: TypeParametersResolver)
 }

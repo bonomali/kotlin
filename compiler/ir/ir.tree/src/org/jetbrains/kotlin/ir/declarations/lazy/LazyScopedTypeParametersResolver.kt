@@ -8,11 +8,10 @@ package org.jetbrains.kotlin.ir.declarations.lazy
 import org.jetbrains.kotlin.descriptors.TypeParameterDescriptor
 import org.jetbrains.kotlin.ir.declarations.IrTypeParametersContainer
 import org.jetbrains.kotlin.ir.symbols.IrTypeParameterSymbol
-import org.jetbrains.kotlin.ir.util.ReferenceSymbolTable
-import org.jetbrains.kotlin.ir.util.TypeParametersResolver
+import org.jetbrains.kotlin.ir.util.MutableTypeParametersResolver
 import java.util.*
 
-class LazyScopedTypeParametersResolver(private val symbolTable: ReferenceSymbolTable) : TypeParametersResolver {
+class LazyScopedTypeParametersResolver : MutableTypeParametersResolver {
 
     private val typeParameterScopes = ArrayDeque<IrTypeParametersContainer>()
 
@@ -35,4 +34,6 @@ class LazyScopedTypeParametersResolver(private val symbolTable: ReferenceSymbolT
             }?.symbol
         }
     }
+
+    override fun snapshot() = error("Should never be called")
 }
